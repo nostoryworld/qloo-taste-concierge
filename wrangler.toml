@@ -1,0 +1,8 @@
+name = "qloo-taste-concierge"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+workers_dev = true
+
+# Secrets / vars (set via `wrangler secret put QLOO_API_KEY` or .dev.vars locally)
+# [vars]
+# QLOO_API_BASE = "https://hackathon.api.qloo.com"

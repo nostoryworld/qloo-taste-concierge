@@ -1,0 +1,1 @@
+{"description":"Taste concierge agent: tell it the artists and films you love, Qloo's taste graph plans dining, events and trips matched to your actual taste.","devDependencies":{"wrangler":"^3.0.0"},"license":"MIT","name":"qloo-taste-concierge","private":true,"scripts":{"deploy":"wrangler deploy","dev":"wrangler dev"},"type":"module","version":"1.0.0"}

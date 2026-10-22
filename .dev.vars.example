@@ -1,0 +1,3 @@
+# Copy to .dev.vars for local development (never commit .dev.vars)
+QLOO_API_KEY=your_qloo_api_key_here
+QLOO_API_BASE=https://hackathon.api.qloo.com
