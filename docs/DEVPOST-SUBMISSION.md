@@ -30,7 +30,7 @@ This app cannot work the same without Qloo — by design:
    ("Burna Boy", "Black Panther") are resolved into Qloo entities across a
    graph of 250M+ entities spanning music, film/TV, dining, fashion and travel.
 2. **Cross-domain affinity via the Insights API.** The concierge calls
-   `POST /v2/insights` on `https://hackathon.api.qloo.com` (header
+   `GET /v2/insights` on `https://hackathon.api.qloo.com` (header
    `X-Api-Key`) to find what those taste entities predict in *other* domains —
    dining, places, destinations. A maps API knows what's near you; only the
    taste graph knows what people with *your* taste actually love.

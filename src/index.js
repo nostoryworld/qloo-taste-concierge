@@ -45,7 +45,7 @@ const HTML = `<!DOCTYPE html>
 
   <div id="out"></div>
 
-  <footer>Built for the Qloo Agentic Hackathon on Devpost. Recommendations are powered by the Qloo Insights API (<code>POST /v2/insights</code>); if no API key is configured the demo runs on a clearly-labelled mock taste layer so it always works end-to-end. MIT licence.</footer>
+  <footer>Built for the Qloo Agentic Hackathon on Devpost. Taste inputs are resolved with Qloo's <code>GET /search</code> and recommendations are powered by the Qloo Insights API (<code>GET /v2/insights</code>); if no API key is configured the demo runs on a clearly-labelled mock taste layer so it always works end-to-end. MIT licence.</footer>
 </main>
 <script>
 const $ = id => document.getElementById(id);
@@ -91,6 +91,8 @@ export default {
         service: "qloo-taste-concierge",
         qloo_base: env.QLOO_API_BASE || "https://hackathon.api.qloo.com",
         qloo_endpoint: "/v2/insights",
+        qloo_method: "GET",
+        qloo_search_endpoint: "/search",
         qloo_key_configured: Boolean(env.QLOO_API_KEY),
       });
     }

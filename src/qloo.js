@@ -1,28 +1,42 @@
 // src/qloo.js — Qloo taste-graph data layer
 //
 // ============================================================================
-// MOCK LAYER — clearly marked. When QLOO_API_KEY is set, tryQloo() attempts
-// the real Qloo API first and this module falls back to the mock data below
-// on ANY failure, so the demo always works end-to-end for judges.
+// MOCK LAYER — clearly marked. When QLOO_API_KEY is set, the live Qloo calls
+// below run first and this module falls back to the mock data on ANY failure,
+// so the demo always works end-to-end for judges.
 //
-// Confirmed Qloo hackathon API facts (verified Oct 22, 2026):
+// Confirmed Qloo hackathon API facts (verified Oct 22, 2026 — see
+// docs/QLOO-API.md, researched from docs.qloo.com):
 //   - Base URL: https://hackathon.api.qloo.com  — MUST be this host.
 //     Other Qloo base URLs return 401 with hackathon keys.
 //   - Auth: header `X-Api-Key: <key>` ONLY — not Bearer, not a query param.
-//   - Primary endpoint: /v2/insights (Insights API, POST or GET).
-//     Do NOT use legacy /recommendations endpoints.
+//   - Insights is GET-only: GET /v2/insights with QUERY-STRING params.
+//     POSTing a JSON body fails ("No path matching request parameters").
+//   - Entity resolution: GET /search?query=<name>&types=urn:entity:artist
+//     (or urn:entity:movie) — take the top match's entity UUID.
+//   - Recommendations: GET /v2/insights?filter.type=<type>
+//     &signal.interests.entities=<comma-separated seed UUIDs>
+//     &feature.explainability=true&take=<n>
+//       Dining  → filter.type=urn:entity:place + filter.location.query=<city>
+//       Events  → NO event entity type exists; venues via urn:entity:place
+//                 (dining picks excluded via filter.exclude.entities)
+//       Trips   → filter.type=urn:entity:destination
+//                 (signal.interests.entities is REQUIRED for destinations)
+//   - Explanations come from each result's query.explainability (which seed
+//     entities contributed, 0–1 scores) + shared tags[] names.
+//   - Do NOT use legacy /recommendations or /recs endpoints anywhere.
 //
 // To wire the real API fully:
 //   1. Set the secret:  wrangler secret put QLOO_API_KEY
 //   2. (Optional) Set QLOO_API_BASE var — defaults to https://hackathon.api.qloo.com
 //      (leave it at the default for hackathon keys; see above).
-//   3. Response mapping lives in tryQloo() / mapInsights(). The shapes
-//      returned by resolveEntities() / getRecommendations() are the contract
-//      the rest of the app consumes — keep those stable.
+//   3. The shapes returned by resolveEntities() / getRecommendations() are
+//      the contract the rest of the app consumes — keep those stable.
 // ============================================================================
 
 const DEFAULT_BASE = "https://hackathon.api.qloo.com";
-const INSIGHTS_PATH = "/v2/insights"; // Insights API — the only endpoint we use
+const INSIGHTS_PATH = "/v2/insights"; // Insights API — GET only, query-string params
+const SEARCH_PATH = "/search"; // Entity resolution — GET, one call per input name
 
 // ---------------------------------------------------------------------------
 // Mock knowledge base: taste signals keyed by normalised artist / film names.
@@ -95,18 +109,243 @@ function deriveProfile(artists, films) {
 }
 
 // ---------------------------------------------------------------------------
+// Live Qloo client — GET only, X-Api-Key header, query-string params.
+// Every helper returns null on ANY failure so callers fall back to mock.
+// ---------------------------------------------------------------------------
+
+async function qlooGet(env, pathName, params) {
+  const key = env?.QLOO_API_KEY;
+  if (!key) return null;
+  const base = (env?.QLOO_API_BASE || DEFAULT_BASE).replace(/\/$/, "");
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === "") continue;
+    qs.set(k, String(v));
+  }
+  try {
+    const res = await fetch(`${base}${pathName}?${qs.toString()}`, {
+      method: "GET",
+      headers: { "X-Api-Key": key }, // the ONLY auth mechanism Qloo accepts
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || data.success === false) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve one free-text name to a Qloo entity via GET /search.
+ * Takes the top match's entity UUID. Field names are parsed defensively —
+ * the /search response shape is documented by usage, not a verbatim schema
+ * (see docs/QLOO-API.md §4.1, open item 1).
+ */
+async function searchEntity(env, name, typeUrn) {
+  const data = await qlooGet(env, SEARCH_PATH, {
+    query: name,
+    types: typeUrn,
+    take: 5,
+  });
+  if (!data) return null;
+  const hits = Array.isArray(data?.results?.entities)
+    ? data.results.entities
+    : Array.isArray(data?.results)
+      ? data.results
+      : Array.isArray(data?.entities)
+        ? data.entities
+        : [];
+  const hit = hits[0];
+  const id = hit?.entity_id || hit?.id;
+  if (!hit || !id) return null;
+  return {
+    name: hit.name || name,
+    type: typeUrn === "urn:entity:artist" ? "artist" : "movie",
+    id: String(id),
+    tags: Array.isArray(hit.tags) ? hit.tags.map((t) => t?.name).filter(Boolean) : [],
+  };
+}
+
+/** One Insights call. Returns the results.entities array, or null on failure. */
+async function insights(env, params) {
+  const data = await qlooGet(env, INSIGHTS_PATH, params);
+  const list = data?.results?.entities;
+  return Array.isArray(list) ? list : null;
+}
+
+/**
+ * Normalise a result's query.explainability into [{ id, score }] sorted desc.
+ * The docs guarantee per-seed contribution scores (0–1, ≥0.1 always present)
+ * but the exact nesting is defensive-parsed here. A `warning` from Qloo means
+ * explainability could not be computed → treat as absent (caller falls back
+ * to tags/rank for the "why" line).
+ */
+function explainabilityContributions(entity) {
+  const ex = entity?.query?.explainability;
+  if (!ex || typeof ex !== "object" || ex.warning) return [];
+  const raw = ex.entities || ex.contributions || ex.scores || ex;
+  const out = [];
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const id = item?.entity_id || item?.id || item?.entity;
+      const score = Number(item?.score ?? item?.contribution ?? item?.weight ?? item?.value);
+      if (id && Number.isFinite(score)) out.push({ id: String(id), score });
+    }
+  } else if (raw && typeof raw === "object") {
+    for (const [id, v] of Object.entries(raw)) {
+      const score = Number(
+        v && typeof v === "object" ? (v.score ?? v.contribution ?? v.weight ?? v.value) : v,
+      );
+      if (Number.isFinite(score)) out.push({ id, score });
+    }
+  }
+  return out.sort((a, b) => b.score - a.score);
+}
+
+function tagNames(entity) {
+  return Array.isArray(entity?.tags) ? entity.tags.map((t) => t?.name).filter(Boolean) : [];
+}
+
+function buildWhy(entity, seedById) {
+  const shared = tagNames(entity).slice(0, 3).join(", ");
+  const contribs = explainabilityContributions(entity);
+  if (contribs.length) {
+    const drivers = contribs
+      .slice(0, 2)
+      .map((c) => `${seedById.get(c.id) || "one of your picks"} (${Math.round(c.score * 100)}% of the signal)`)
+      .join(" and ");
+    return (
+      `Qloo's taste graph drove this from your love of ${drivers}` +
+      (shared ? ` — connected through shared taste signals: ${shared}.` : ".")
+    );
+  }
+  // Explainability unavailable (or warning) → fall back to shared tags + rank.
+  const seedNames = [...seedById.values()].slice(0, 2).join(" + ");
+  return (
+    `A top taste-graph match for ${seedNames || "your picks"}` +
+    (shared ? `, sharing taste signals like ${shared}` : "") +
+    "."
+  );
+}
+
+function matchScore(entity, index) {
+  const contribs = explainabilityContributions(entity);
+  if (contribs.length) return Math.min(1, Math.max(0, contribs[0].score));
+  if (typeof entity?.popularity === "number") return Math.min(1, Math.max(0, entity.popularity));
+  return Math.max(0.5, 0.95 - index * 0.04); // rank-decay fallback
+}
+
+function subtypeLabel(entity, fallback) {
+  const genreTag = (entity?.tags || []).find(
+    (t) => typeof t?.type === "string" && t.type.startsWith("urn:tag:genre"),
+  );
+  if (genreTag?.name) return genreTag.name;
+  const sub = String(entity?.subtype || "").replace("urn:entity:", "").replace(/_/g, " ");
+  return sub ? titleCase(sub) : fallback;
+}
+
+function entityArea(entity, fallback) {
+  const geo = entity?.properties?.geocode;
+  if (geo && typeof geo === "object") return geo.city || geo.name || geo.admin1_region || fallback;
+  if (typeof entity?.properties?.address === "string" && entity.properties.address) {
+    return entity.properties.address;
+  }
+  return fallback;
+}
+
+function priceHint(entity) {
+  const lvl = entity?.properties?.price_level;
+  return typeof lvl === "number" && lvl >= 1 && lvl <= 4 ? "$".repeat(lvl) : undefined;
+}
+
+/** Map one live Insights entity into the app's recommendation contract. */
+function mapRec(entity, index, seedById, { categoryFallback, areaFallback }) {
+  const rec = {
+    name: entity?.name || "Untitled",
+    category: subtypeLabel(entity, categoryFallback),
+    score: matchScore(entity, index),
+    why: buildWhy(entity, seedById),
+    area: entityArea(entity, areaFallback),
+  };
+  const price = priceHint(entity);
+  if (price) rec.priceHint = price;
+  return rec;
+}
+
+/**
+ * Live recommendations: three GET /v2/insights calls off one seed UUID list.
+ * Returns null unless ALL three buckets come back non-empty — the caller then
+ * falls back to the mock layer, so the demo never shows a half-empty plan.
+ */
+async function liveRecommendations({ city, entities }, env) {
+  const seeds = (entities || []).filter((e) => e?.id && !String(e.id).startsWith("mock:"));
+  if (!seeds.length) return null;
+  const seedIds = seeds.map((e) => e.id).join(",");
+  const seedById = new Map(seeds.map((e) => [String(e.id), e.name]));
+  const signals = {
+    "signal.interests.entities": seedIds,
+    "feature.explainability": "true",
+    take: 5,
+  };
+
+  // Dining — places in the requested city.
+  const diningRaw = await insights(env, {
+    ...signals,
+    "filter.type": "urn:entity:place",
+    "filter.location.query": city,
+  });
+  if (!diningRaw?.length) return null;
+
+  // Events & experiences — Qloo has NO event entity type; these are venues
+  // (also urn:entity:place), with the dining picks excluded so the sections
+  // never duplicate. The UI keeps the "Events & experiences" name.
+  const diningIds = diningRaw.map((e) => e?.entity_id || e?.id).filter(Boolean).join(",");
+  const eventsRaw = await insights(env, {
+    ...signals,
+    "filter.type": "urn:entity:place",
+    "filter.location.query": city,
+    ...(diningIds ? { "filter.exclude.entities": diningIds } : {}),
+  });
+  if (!eventsRaw?.length) return null;
+
+  // Trips — destinations. signal.interests.entities is REQUIRED for this type.
+  const tripsRaw = await insights(env, {
+    ...signals,
+    "filter.type": "urn:entity:destination",
+  });
+  if (!tripsRaw?.length) return null;
+
+  return {
+    dining: diningRaw.map((e, i) => mapRec(e, i, seedById, { categoryFallback: "Place", areaFallback: city })),
+    events: eventsRaw.map((e, i) => mapRec(e, i, seedById, { categoryFallback: "Venue", areaFallback: city })),
+    trips: tripsRaw.map((e, i) => mapRec(e, i, seedById, { categoryFallback: "Destination", areaFallback: "Destination" })),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Public API — stable contract for the rest of the app
 // ---------------------------------------------------------------------------
 
 /**
  * Resolve free-text artist / film names to taste entities.
+ * Live: one GET /search call per input, top match's UUID.
  * Returns: [{ name, type: "artist"|"movie", id, tags }]
  */
 export async function resolveEntities({ artists = [], films = [] }, env = {}) {
-  // Entity resolution also goes through the Insights API (/v2/insights) —
-  // there is no separate legacy search/recommendations call in this app.
-  const live = await tryQloo(env, { query: [...artists, ...films].join(", ") });
-  if (live?.entities) return live.entities;
+  if (env?.QLOO_API_KEY) {
+    const live = [];
+    for (const name of artists) {
+      const e = await searchEntity(env, name, "urn:entity:artist");
+      if (e) live.push(e);
+    }
+    for (const name of films) {
+      const e = await searchEntity(env, name, "urn:entity:movie");
+      if (e) live.push(e);
+    }
+    if (live.length) return live;
+    // Nothing resolved live → fall through to mock entities.
+  }
 
   // MOCK fallback
   const out = [];
@@ -127,8 +366,12 @@ export async function resolveEntities({ artists = [], films = [] }, env = {}) {
  * Returns: { dining: [Rec], events: [Rec], trips: [Rec], profile, source }
  * Rec = { name, category, score (0-1), why, area?, priceHint? }
  */
-export async function getRecommendations({ artists = [], films = [], city = "Lagos", vibe = "" }, env = {}) {
+export async function getRecommendations({ artists = [], films = [], city = "Lagos", vibe = "", entities = [] }, env = {}) {
   const profile = deriveProfile(artists, films);
+  // Fold any live entity tags (from /search) into the displayed profile.
+  for (const e of entities || []) {
+    for (const t of e?.tags || []) if (!profile.tags.includes(t)) profile.tags.push(t);
+  }
   const seedNames = [...artists, ...films].filter(Boolean);
   const anchor = seedNames[0] || "your taste";
   const secondary = seedNames[1] || anchor;
@@ -136,13 +379,8 @@ export async function getRecommendations({ artists = [], films = [], city = "Lag
   const cuisine = profile.cuisines[0] || "modern seasonal";
   const cuisine2 = profile.cuisines[1] || cuisine;
 
-  const live = await tryQloo(env, {
-    entities: seedNames,
-    city,
-    vibe,
-    tags: profile.tags,
-  });
-  if (live?.dining && live?.events && live?.trips) {
+  const live = await liveRecommendations({ city, entities }, env);
+  if (live) {
     return { ...live, profile, source: "qloo" };
   }
 
@@ -229,34 +467,6 @@ export async function getRecommendations({ artists = [], films = [], city = "Lag
   ];
 
   return { dining, events, trips, profile, source: "mock" };
-}
-
-// ---------------------------------------------------------------------------
-// Real Qloo attempt — returns null on any failure so callers fall back.
-// Confirmed hackathon API shape:
-//   POST https://hackathon.api.qloo.com/v2/insights
-//   Header: X-Api-Key: <QLOO_API_KEY>   (no Bearer token, no query param)
-// Legacy /recommendations endpoints are NOT used anywhere in this app.
-// ---------------------------------------------------------------------------
-async function tryQloo(env, payload) {
-  const key = env?.QLOO_API_KEY;
-  if (!key) return null;
-  const base = env?.QLOO_API_BASE || DEFAULT_BASE;
-  try {
-    const res = await fetch(base.replace(/\/$/, "") + INSIGHTS_PATH, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Api-Key": key,
-      },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data?.results || data || null;
-  } catch {
-    return null;
-  }
 }
 
 function titleCase(s) {
