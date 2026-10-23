@@ -20,6 +20,7 @@ const HTML = `<!DOCTYPE html>
   .card{background:var(--card);border-radius:12px;padding:16px;margin:10px 0;border-left:4px solid var(--accent2)}
   .score{float:right;background:var(--accent);color:#111;border-radius:999px;padding:2px 10px;font-weight:700;font-size:.85rem}
   .why{color:var(--muted);font-size:.92rem} .meta{font-size:.85rem;color:var(--muted)} .badge{font-size:.75rem;border:1px solid #444;border-radius:999px;padding:2px 8px;color:var(--muted)}
+  .tagrow{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px} .pill{font-size:.72rem;background:#121126;border:1px solid #3a3757;border-radius:999px;padding:2px 9px;color:var(--ink)}
   #status{min-height:1.2em;color:var(--muted)} footer{margin-top:48px;color:var(--muted);font-size:.85rem}
 </style>
 </head>
@@ -56,7 +57,8 @@ function section(title, items){
   return "<h2>"+title+"</h2>"+items.map(r=>
     '<div class="card"><span class="score">'+Math.round((r.score||0)*100)+'% match</span>'+
     "<strong>"+esc(r.name)+"</strong><div class='meta'>"+esc(r.category||"")+(r.area?" · "+esc(r.area):"")+(r.priceHint?" · "+esc(r.priceHint):"")+"</div>"+
-    '<p class="why">💡 Why this matches your taste: '+esc(r.why||"")+"</p></div>").join("");
+    '<p class="why">💡 Why this matches your taste: '+esc(r.why||"")+"</p>"+
+    ((r.tags&&r.tags.length)?'<div class="tagrow">'+r.tags.map(t=>'<span class="pill">'+esc(t)+"</span>").join("")+"</div>":"")+"</div>").join("");
 }
 $("f").addEventListener("submit", async e=>{
   e.preventDefault(); $("go").disabled=true; $("status").textContent="Reading your taste profile via Qloo…"; $("out").innerHTML="";

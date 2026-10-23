@@ -19,9 +19,20 @@
 //     &feature.explainability=true&take=<n>
 //       Dining  → filter.type=urn:entity:place + filter.location.query=<city>
 //       Events  → NO event entity type exists; venues via urn:entity:place
-//                 (dining picks excluded via filter.exclude.entities)
 //       Trips   → filter.type=urn:entity:destination
 //                 (signal.interests.entities is REQUIRED for destinations)
+//   - Place results are affinity-ranked across ALL place kinds (banks,
+//     schools and radio stations outrank restaurants in raw affinity), so
+//     dining/events are separated CLIENT-SIDE: a wide pool (take=30) plus a
+//     restaurant-tag-targeted call are merged, then classified from each
+//     entity's `urn:tag:category:place:*` tags, `urn:tag:genre:place:*`
+//     tags and properties.primary_genre (see classifyPlace). Blocked
+//     service categories (bank, school, media…) never lead a section;
+//     they only backfill as a last resort so a section is never empty.
+//     Server-side filter.tags=<restaurant genre tag> helps the dining pool
+//     but is a SOFT filter (off-category results still appear), and
+//     filter.exclude.tags did NOT remove genre-blocked places in live
+//     tests — classification must stay client-side. (Verified Oct 23.)
 //   - Explanations come from each result's query.explainability (which seed
 //     entities contributed, 0–1 scores) + shared tags[] names.
 //   - Do NOT use legacy /recommendations or /recs endpoints anywhere.
@@ -216,6 +227,124 @@ function tagNames(entity) {
   return Array.isArray(entity?.tags) ? entity.tags.map((t) => t?.name).filter(Boolean) : [];
 }
 
+// ---------------------------------------------------------------------------
+// Place classification — Qloo ranks places by taste affinity across ALL
+// place kinds, so raw results mix restaurants with banks, schools and radio
+// stations. Every place carries machine-readable category data (verified
+// live Oct 23, 2026):
+//   - tags of type "urn:tag:category:place" → e.g. urn:tag:category:place:bank
+//   - tags of type "urn:tag:genre:place"    → e.g. …:restaurant:barbecue
+//   - properties.primary_genre.id          → e.g. urn:tag:genre:place:hotel
+//   - properties.cuisine_description / tags of type urn:tag:dining_options:*
+// We classify from those signals — never from the affinity score itself.
+// ---------------------------------------------------------------------------
+
+const GENRE_PREFIX = "urn:tag:genre:place:";
+const CATEGORY_PREFIX = "urn:tag:category:place:";
+
+/** Food & drink signal in a genre leaf / category slug. */
+const FOOD_RE =
+  /restaurant|cafe|coffee|bakery|eatery|diner|bistro|steakhouse|pizzeria|sushi|ramen|noodle|barbecue|bbq|grill|dessert|ice_cream|juice|tea_house|brewery|brewpub|winery|cafeteria|food|pub|bar(?::|$|_)|lounge_bar/;
+/** Experience / venue signal (events bucket). */
+const EXPERIENCE_RE =
+  /hotel|night_club|live_music|movie_theater|cinema|theatre|theater|museum|gallery|art_center|art_gallery|tourist_attraction|landmark|monument|memorial|sculpture|palace|scenic|observation|arena|stadium|event_venue|events_cent|casino|market|park|natural_feature|plaza|spa|resort|swim_club|lounge|visitor_center|library|zoo|aquarium|botanical|comedy|concert|performing_arts|club/;
+/** Pure services / non-visit categories — never lead a section. */
+const BLOCKED_RE =
+  /bank|atm|corporate_office|office|school|university|college|military|non_governmental|\bngo\b|media_house|radio|record_company|recording_studio|movie_studio|film_production|pharmacy|hospital|clinic|psychotherap|mental_health|counsel|pentecostal|church|mosque|synagogue|place_of_worship|architect|engineer|interior_design|tattoo|barber|government|police|funeral|real_estate|insurance|lawyer|law_firm|dentist|doctor|veterinar|gas_station|car_wash|car_rental|storage|warehouse|logistics|coworking|training_center|computer_support|video_production|photography_studio|video_editing|post_office|courthouse|embassy/;
+/** Retail-led places are shopping, not experiences. */
+const RETAIL_RE = /gift_shop|clothing_store|antique_store|book_store|store|shop|shopping|mall/;
+/** Obvious non-fit name patterns (secondary signal only). */
+const NAME_BLOCK_RE = /\b(bank|atm|radio|pharmacy|hospital|clinic|school|university|church|mosque)\b|\bfm\b/i;
+
+function placeSignals(entity) {
+  const tags = Array.isArray(entity?.tags) ? entity.tags : [];
+  const cats = [];
+  const genres = [];
+  let hasDiningOptions = false;
+  for (const t of tags) {
+    const id = String(t?.id || "");
+    if (t?.type === "urn:tag:category:place" && id.startsWith(CATEGORY_PREFIX)) cats.push(id.slice(CATEGORY_PREFIX.length));
+    else if (t?.type === "urn:tag:genre:place" && id.startsWith(GENRE_PREFIX)) genres.push(id.slice(GENRE_PREFIX.length));
+    else if (String(t?.type || "").startsWith("urn:tag:dining_options")) hasDiningOptions = true;
+  }
+  const pg = entity?.properties?.primary_genre;
+  const pgId = typeof pg?.id === "string" ? pg.id : "";
+  const primaryLeaf = pgId.startsWith(GENRE_PREFIX) ? pgId.slice(GENRE_PREFIX.length) : "";
+  if (primaryLeaf && !genres.includes(primaryLeaf)) genres.unshift(primaryLeaf);
+  return {
+    cats,
+    genres,
+    primaryLeaf,
+    primaryGenreName: typeof pg?.name === "string" ? pg.name : "",
+    hasDiningOptions,
+    hasCuisineDesc: Boolean(entity?.properties?.cuisine_description),
+    liveMusic: entity?.properties?.live_music === true,
+  };
+}
+
+/**
+ * Classify one live place entity.
+ * Returns { home: "dining"|"events"|null, dining, events, blocked } —
+ * `home` is the bucket the place belongs to on its strongest signal;
+ * blocked places are pure services and only ever backfill (last resort).
+ */
+function classifyPlace(entity) {
+  const s = placeSignals(entity);
+  const leaf = s.primaryLeaf || "";
+  const catText = s.cats.join(" ");
+  const genreText = s.genres.join(" ");
+
+  const foodPrimary = FOOD_RE.test(leaf);
+  const foodAny = foodPrimary || FOOD_RE.test(catText) || FOOD_RE.test(genreText);
+  const foodSignal = foodAny || s.hasCuisineDesc || s.hasDiningOptions;
+
+  // A blocked primary genre (studio, bank…) wins over incidental tag-level
+  // food tags — unless the place is primarily a food venue itself.
+  const blockedHit =
+    BLOCKED_RE.test(leaf) || BLOCKED_RE.test(catText) || NAME_BLOCK_RE.test(String(entity?.name || ""));
+  const blocked = blockedHit && !leaf.startsWith("restaurant") && !leaf.includes(":restaurant");
+
+  const experienceSignal = EXPERIENCE_RE.test(leaf) || EXPERIENCE_RE.test(catText) || s.liveMusic;
+  const retailPrimary = RETAIL_RE.test(leaf);
+
+  let dining = foodSignal && !blocked;
+  // Retail-led places (gift shops, stores) are not experiences; a hotel or
+  // venue that merely contains a shop still qualifies via its own leaf.
+  let events = !blocked && experienceSignal && !(retailPrimary && !EXPERIENCE_RE.test(leaf));
+
+  // Primary-genre identity wins for tier-1 slots: a place whose PRIMARY
+  // genre is retail (an antique store that happens to contain a café, a
+  // shopping mall with a food court) reads as retail to a human, whatever
+  // its secondary tags say. Demote it to the unclassified backfill tier —
+  // unless food IS its primary genre.
+  if (retailPrimary && !foodPrimary) {
+    dining = false;
+    events = false;
+  }
+
+  let home = null;
+  if (dining && events) home = foodPrimary ? "dining" : "events";
+  else if (dining) home = "dining";
+  else if (events) home = "events";
+  return { home, dining, events, blocked, signals: s };
+}
+
+/** Short display tags for a pick (genre/category names Qloo attached). */
+function displayTags(entity) {
+  const s = placeSignals(entity);
+  const out = [];
+  const push = (v) => {
+    const label = titleCase(String(v || "").replace(/_/g, " ").replace(/:/g, " · "));
+    if (label && !out.some((x) => x.toLowerCase() === label.toLowerCase())) out.push(label);
+  };
+  if (s.primaryGenreName) push(s.primaryGenreName);
+  for (const g of s.genres) push(g.split(":").pop());
+  for (const c of s.cats) push(c);
+  // Destinations (and anything without place categories): use raw tag names.
+  if (!out.length) for (const n of tagNames(entity)) push(n);
+  return out.slice(0, 3);
+}
+
 function buildWhy(entity, seedById) {
   const shared = tagNames(entity).slice(0, 3).join(", ");
   const contribs = explainabilityContributions(entity);
@@ -249,6 +378,10 @@ function matchScore(entity, index) {
 }
 
 function subtypeLabel(entity, fallback) {
+  // Verified live: properties.primary_genre.name is the cleanest category
+  // label Qloo gives a place ("Restaurant", "Hotel", "Art gallery"…).
+  const pgName = entity?.properties?.primary_genre?.name;
+  if (typeof pgName === "string" && pgName) return pgName;
   const genreTag = (entity?.tags || []).find(
     (t) => typeof t?.type === "string" && t.type.startsWith("urn:tag:genre"),
   );
@@ -279,16 +412,56 @@ function mapRec(entity, index, seedById, { categoryFallback, areaFallback }) {
     score: matchScore(entity, index),
     why: buildWhy(entity, seedById),
     area: entityArea(entity, areaFallback),
+    tags: displayTags(entity),
   };
   const price = priceHint(entity);
   if (price) rec.priceHint = price;
   return rec;
 }
 
+const RESTAURANT_GENRE_TAG = "urn:tag:genre:place:restaurant";
+
 /**
- * Live recommendations: three GET /v2/insights calls off one seed UUID list.
- * Returns null unless ALL three buckets come back non-empty — the caller then
- * falls back to the mock layer, so the demo never shows a half-empty plan.
+ * Fill one bucket (3 slots) from classified candidates, in tier order:
+ *   1. places whose home bucket this is (strongest on-category signal)
+ *   2. places classified for the OTHER bucket (a hotel still works as an
+ *      events backfill for dining — it has a restaurant; a great restaurant
+ *      is still a night out) — only when `other` is allowed for this bucket
+ *   3. unclassified, non-blocked places (unknown kind, real affinity)
+ *   4. blocked pure services (bank, school…) — LAST resort only, so a
+ *      section is never empty; they never lead a section when any
+ *      visit-worthy candidate exists.
+ * Returns the picked entities; picked IDs are added to `used`.
+ */
+function fillBucket(classified, home, other, used) {
+  const picks = [];
+  const tiers = [
+    (c) => c.home === home && !used.has(c.id),
+    (c) => c.home === other && !used.has(c.id),
+    (c) => !c.blocked && !c.home && !used.has(c.id),
+    (c) => c.blocked && !used.has(c.id),
+  ];
+  for (const tier of tiers) {
+    for (const c of classified) {
+      if (picks.length >= 3) break;
+      if (tier(c)) {
+        picks.push(c.entity);
+        used.add(c.id);
+      }
+    }
+    if (picks.length >= 3) break;
+  }
+  return picks;
+}
+
+/**
+ * Live recommendations off one seed UUID list. Place candidates come from
+ * two GET /v2/insights calls — a wide affinity pool (take=30) and a
+ * restaurant-tag-targeted call (take=15) — merged by affinity and split
+ * into Dining / Events client-side by classifyPlace(). Filtering NEVER
+ * fails the whole plan: buckets backfill by tier (see fillBucket), and the
+ * function only returns null when Qloo itself returns nothing usable —
+ * the caller then falls back to the mock layer as before.
  */
 async function liveRecommendations({ city, entities }, env) {
   const seeds = (entities || []).filter((e) => e?.id && !String(e.id).startsWith("mock:"));
@@ -298,39 +471,66 @@ async function liveRecommendations({ city, entities }, env) {
   const signals = {
     "signal.interests.entities": seedIds,
     "feature.explainability": "true",
-    take: 3, // app contract: 3 ranked picks per section (matches mock shape)
   };
 
-  // Dining — places in the requested city.
-  const diningRaw = await insights(env, {
+  // Wide pool — the raw taste ranking across every place kind in the city.
+  const poolRaw = await insights(env, {
     ...signals,
     "filter.type": "urn:entity:place",
     "filter.location.query": city,
+    take: 30,
   });
-  if (!diningRaw?.length) return null;
+  if (!poolRaw?.length) return null;
 
-  // Events & experiences — Qloo has NO event entity type; these are venues
-  // (also urn:entity:place), with the dining picks excluded so the sections
-  // never duplicate. The UI keeps the "Events & experiences" name.
-  const diningIds = diningRaw.map((e) => e?.entity_id || e?.id).filter(Boolean).join(",");
-  const eventsRaw = await insights(env, {
-    ...signals,
-    "filter.type": "urn:entity:place",
-    "filter.location.query": city,
-    ...(diningIds ? { "filter.exclude.entities": diningIds } : {}),
-  });
-  if (!eventsRaw?.length) return null;
+  // Dining-targeted call — filter.tags with the restaurant genre tag is a
+  // SOFT server-side filter (verified live: off-category results still
+  // appear), but it pulls genuine restaurants far up the list in cities
+  // where the raw pool is all galleries/landmarks. Best-effort: a failure
+  // here just means the pool alone feeds classification.
+  const diningRaw =
+    (await insights(env, {
+      ...signals,
+      "filter.type": "urn:entity:place",
+      "filter.location.query": city,
+      "filter.tags": RESTAURANT_GENRE_TAG,
+      take: 15,
+    })) || [];
+
+  // Merge + dedupe by entity ID, then order by affinity (the taste signal
+  // we must not lose) — classification decides the bucket, affinity the rank.
+  const byId = new Map();
+  for (const e of [...poolRaw, ...diningRaw]) {
+    const id = String(e?.entity_id || e?.id || "");
+    if (id && !byId.has(id)) byId.set(id, e);
+  }
+  const affinityOf = (e) => {
+    const a = Number(e?.query?.affinity);
+    return Number.isFinite(a) ? a : typeof e?.popularity === "number" ? e.popularity : 0;
+  };
+  const classified = [...byId.values()]
+    .sort((a, b) => affinityOf(b) - affinityOf(a))
+    .map((entity) => ({
+      entity,
+      id: String(entity?.entity_id || entity?.id),
+      ...classifyPlace(entity),
+    }));
+
+  const used = new Set();
+  const dining = fillBucket(classified, "dining", "events", used);
+  const events = fillBucket(classified, "events", "dining", used);
+  if (!dining.length || !events.length) return null;
 
   // Trips — destinations. signal.interests.entities is REQUIRED for this type.
   const tripsRaw = await insights(env, {
     ...signals,
     "filter.type": "urn:entity:destination",
+    take: 3,
   });
   if (!tripsRaw?.length) return null;
 
   return {
-    dining: diningRaw.map((e, i) => mapRec(e, i, seedById, { categoryFallback: "Place", areaFallback: city })),
-    events: eventsRaw.map((e, i) => mapRec(e, i, seedById, { categoryFallback: "Venue", areaFallback: city })),
+    dining: dining.map((e, i) => mapRec(e, i, seedById, { categoryFallback: "Restaurant", areaFallback: city })),
+    events: events.map((e, i) => mapRec(e, i, seedById, { categoryFallback: "Venue", areaFallback: city })),
     trips: tripsRaw.map((e, i) => mapRec(e, i, seedById, { categoryFallback: "Destination", areaFallback: "Destination" })),
   };
 }
@@ -376,7 +576,7 @@ export async function resolveEntities({ artists = [], films = [] }, env = {}) {
  * Get ranked recommendations in three buckets.
  * Input:  { artists, films, city, vibe, entities }
  * Returns: { dining: [Rec], events: [Rec], trips: [Rec], profile, source }
- * Rec = { name, category, score (0-1), why, area?, priceHint? }
+ * Rec = { name, category, score (0-1), why, area?, priceHint?, tags? }
  */
 export async function getRecommendations({ artists = [], films = [], city = "Lagos", vibe = "", entities = [] }, env = {}) {
   const profile = deriveProfile(artists, films);
@@ -405,6 +605,7 @@ export async function getRecommendations({ artists = [], films = [], city = "Lag
       why: `Because you love ${anchor} — Qloo's taste graph links that ${tagLine} profile to ${cuisine} dining; this is its highest-affinity match in ${city}.`,
       area: city,
       priceHint: "$$",
+      tags: [titleCase(cuisine), "Restaurant"],
     },
     {
       name: `The ${titleCase(profile.tags[0] || "eclectic")} Table`,
@@ -413,6 +614,7 @@ export async function getRecommendations({ artists = [], films = [], city = "Lag
       why: `Fans of ${secondary} over-index on ${cuisine2} spots with a ${profile.mood} atmosphere — exactly this room's profile.`,
       area: city,
       priceHint: "$$",
+      tags: [titleCase(cuisine2), "Small plates"],
     },
     {
       name: "Late-Night Listening Bar & Grill",
@@ -421,6 +623,7 @@ export async function getRecommendations({ artists = [], films = [], city = "Lag
       why: `Your picks share a ${profile.mood} mood; Qloo maps that mood to vinyl listening bars where the playlist is curated like a setlist.`,
       area: city,
       priceHint: "$$",
+      tags: ["Listening bar", "Grill"],
     },
   ];
 
@@ -432,6 +635,7 @@ export async function getRecommendations({ artists = [], films = [], city = "Lag
       why: `Direct taste adjacency — audiences for ${anchor} are Qloo's strongest predictor for this kind of ${tagLine} live night.`,
       area: city,
       priceHint: "$$",
+      tags: ["Live music", "Venue"],
     },
     {
       name: "Cult Film + Director's Cut Screening",
@@ -440,6 +644,7 @@ export async function getRecommendations({ artists = [], films = [], city = "Lag
       why: `Your film taste (${films.join(", ") || "eclectic cinema"}) clusters with repertory screenings and post-film discussions in Qloo's graph.`,
       area: city,
       priceHint: "$",
+      tags: ["Cinema", "Screening"],
     },
     {
       name: "Taste-Makers Market & Pop-Up",
@@ -448,6 +653,7 @@ export async function getRecommendations({ artists = [], films = [], city = "Lag
       why: `A discovery pick: people with your ${tagLine} profile rate pop-ups and maker markets far above average${vibe ? ` — fits your "${vibe}" vibe` : ""}.`,
       area: city,
       priceHint: "$",
+      tags: ["Pop-up", "Market"],
     },
   ];
 
@@ -459,6 +665,7 @@ export async function getRecommendations({ artists = [], films = [], city = "Lag
       why: `Built around your profile end-to-end: ${cuisine} dinners, a ${tagLine} live night, and a film-location walk — sequenced by Qloo affinity, not generic top-10 lists.`,
       area: city,
       priceHint: "$$",
+      tags: ["Weekend", "Itinerary"],
     },
     {
       name: "Follow the Sound: Music-Pilgrimage Day Trip",
@@ -467,6 +674,7 @@ export async function getRecommendations({ artists = [], films = [], city = "Lag
       why: `Because ${anchor} anchors your taste, Qloo surfaces the studios, record shops and venues culturally closest to that sound near ${city}.`,
       area: city,
       priceHint: "$",
+      tags: ["Day trip", "Music"],
     },
     {
       name: "Next City to Try: Taste-Twin Destination",
@@ -475,6 +683,7 @@ export async function getRecommendations({ artists = [], films = [], city = "Lag
       why: `Qloo's taste twins — people who love ${secondary} like you do — rate this destination's food-and-film scene highest. A stretch pick for your next trip.`,
       area: "Taste-twin city",
       priceHint: "$$$",
+      tags: ["Destination", "Taste twin"],
     },
   ];
 
