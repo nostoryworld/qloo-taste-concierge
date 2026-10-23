@@ -60,6 +60,6 @@ This app cannot work the same without Qloo — by design:
   prediction usable in one click.
 
 ## TODO before submitting
-- [ ] Confirm live demo shows `source: "qloo"` once the hackathon key is wired
-- [ ] Confirm GitHub repo is public and README renders
-- [ ] Devpost username / account check (same account used on the API key form)
+- [x] Confirm live demo shows `source: "qloo"` once the hackathon key is wired — VERIFIED Oct 23, 2026 (real entities, explainability why-lines, health shows qloo_key_configured: true)
+- [x] Confirm GitHub repo is public and README renders — verified Oct 22, 2026
+- [x] Devpost username / account check — nostoryboss (confirmed by user Oct 22, 2026; same account used on the API key form)
