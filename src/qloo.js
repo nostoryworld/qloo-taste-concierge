@@ -138,9 +138,10 @@ async function qlooGet(env, pathName, params) {
 
 /**
  * Resolve one free-text name to a Qloo entity via GET /search.
- * Takes the top match's entity UUID. Field names are parsed defensively —
- * the /search response shape is documented by usage, not a verbatim schema
- * (see docs/QLOO-API.md §4.1, open item 1).
+ * Takes the top match's entity UUID. VERIFIED live shape (Oct 23, 2026):
+ * top-level `results` is a BARE ARRAY of hits, each
+ * { name, entity_id (UUID), types: [...], popularity (0–1), tags: [{name,…}] }.
+ * The wrapped variants below are kept as harmless defensive fallbacks.
  */
 async function searchEntity(env, name, typeUrn) {
   const data = await qlooGet(env, SEARCH_PATH, {
@@ -176,8 +177,10 @@ async function insights(env, params) {
 
 /**
  * Normalise a result's query.explainability into [{ id, score }] sorted desc.
- * The docs guarantee per-seed contribution scores (0–1, ≥0.1 always present)
- * but the exact nesting is defensive-parsed here. A `warning` from Qloo means
+ * VERIFIED live shape (Oct 23, 2026):
+ *   query.explainability = { "signal.interests.entities":
+ *     [ { entity_id, score }, … ] }   — scores are signal shares, sum ≈ 1.
+ * Other nestings are still defensive-parsed. A `warning` from Qloo means
  * explainability could not be computed → treat as absent (caller falls back
  * to tags/rank for the "why" line).
  */
@@ -186,18 +189,24 @@ function explainabilityContributions(entity) {
   if (!ex || typeof ex !== "object" || ex.warning) return [];
   const raw = ex.entities || ex.contributions || ex.scores || ex;
   const out = [];
+  const pushItem = (item) => {
+    const id = item?.entity_id || item?.id || item?.entity;
+    const score = Number(item?.score ?? item?.contribution ?? item?.weight ?? item?.value);
+    if (id && Number.isFinite(score)) out.push({ id: String(id), score });
+  };
   if (Array.isArray(raw)) {
-    for (const item of raw) {
-      const id = item?.entity_id || item?.id || item?.entity;
-      const score = Number(item?.score ?? item?.contribution ?? item?.weight ?? item?.value);
-      if (id && Number.isFinite(score)) out.push({ id: String(id), score });
-    }
+    raw.forEach(pushItem);
   } else if (raw && typeof raw === "object") {
-    for (const [id, v] of Object.entries(raw)) {
-      const score = Number(
-        v && typeof v === "object" ? (v.score ?? v.contribution ?? v.weight ?? v.value) : v,
-      );
-      if (Number.isFinite(score)) out.push({ id, score });
+    for (const [key, v] of Object.entries(raw)) {
+      if (Array.isArray(v)) {
+        // Real shape: { "signal.interests.entities": [{ entity_id, score }] }
+        v.forEach(pushItem);
+      } else {
+        const score = Number(
+          v && typeof v === "object" ? (v.score ?? v.contribution ?? v.weight ?? v.value) : v,
+        );
+        if (Number.isFinite(score)) out.push({ id: key, score });
+      }
     }
   }
   return out.sort((a, b) => b.score - a.score);
@@ -230,8 +239,11 @@ function buildWhy(entity, seedById) {
 }
 
 function matchScore(entity, index) {
-  const contribs = explainabilityContributions(entity);
-  if (contribs.length) return Math.min(1, Math.max(0, contribs[0].score));
+  // VERIFIED live: each Insights result carries query.affinity (0–1) — that
+  // is the match strength. Explainability scores are signal *shares* (they
+  // sum to ~1 across seeds), so they belong in the "why" line, not the score.
+  const aff = Number(entity?.query?.affinity);
+  if (Number.isFinite(aff) && aff > 0) return Math.min(1, Math.max(0, aff));
   if (typeof entity?.popularity === "number") return Math.min(1, Math.max(0, entity.popularity));
   return Math.max(0.5, 0.95 - index * 0.04); // rank-decay fallback
 }
@@ -286,7 +298,7 @@ async function liveRecommendations({ city, entities }, env) {
   const signals = {
     "signal.interests.entities": seedIds,
     "feature.explainability": "true",
-    take: 5,
+    take: 3, // app contract: 3 ranked picks per section (matches mock shape)
   };
 
   // Dining — places in the requested city.
